@@ -1,0 +1,135 @@
+#!/bin/bash
+
+#!/bin/bash
+# This script is designed to be used by Nagios. It checks for the availability of both Microsoft SQL Server 7 and 2000.
+#
+# Requirements:
+#
+# FreeTDS 6.0+ (http://www.freetds.org/)
+#
+# It was written by Tom De Blende (tom.deblende@village.uunet.be) in 2003. 
+#
+# Version 1.0.
+# Version 1.1: Rewritten the initial script so that it not only works from the CLI but also from within Nagios. Always helpful...
+# Version 1.2: Grouped output so things look a bit better.
+# Version 2.0: Rewritten the plugin to support version 6.0+ of FreeTDS. 
+#              Removed sqsh requirement as version 6.0+ of FreeTDS now offers its own CLI client: tsql.
+#              Older versions of FreeTDS are no longer supported.
+#
+#
+# You might want to change these values:
+
+sqshcmd=`which sqsh`
+tsqlcmd=`which tsql`
+catcmd=`which cat`
+grepcmd=`which grep`
+rmcmd=`which rm`
+mktempcmd=`which mktemp`
+wccmd=`which wc`
+sedcmd=`which sed`
+trcmd=`which tr`
+uniqcmd=`which uniq`
+
+###################################################################################################################
+
+hostname=$1
+usr=$2
+pswd=$3
+srv=$4
+
+warnusers=100
+critusers=150
+
+if [ ! "$#" == "4" ]; then
+        echo -e "\nYou did not supply enough arguments. \nUsage: $0 <host> <username> <password> <version> \n \n$0 checks Microsoft SQL Server connectivity. It works with versions 7 and 2000.\n\nYou need a working version of FreeTDS (http://www.freetds.org/) and tsql (included in FreeTDS 6.0+) to connect to the SQL server. \nIt was written by Tom De Blende (tom.deblende@village.uunet.be) in 2003. \n\nExample:\n $0 dbserver sa f00bar 2000\n" && exit "3"
+
+elif [ "$tsqlcmd" == "" ] && [ "$sqshcmd" == "" ]; then
+	echo -e "tsql not found! Please verify you have a working version of tsql (included in the FreeTDS version 6.0+) and enter the full path in the script." && exit "3"
+
+fi
+
+exit="3"
+
+
+# Creating the command file that contains the sql statement that has to be run on the SQL server.
+tmpfile=`$mktempcmd /tmp/$hostname.XXXXXX`
+
+if [ "$srv" == "7" ]; then
+        spid=7
+elif [ "$srv" == "2000" ]; then
+        spid=50
+else
+	echo -e "$srv is not a supported MS SQL Server version!" && exit "3"
+fi
+
+usercount_sql="SELECT 'UserCount: ' AS DataDesc, COUNT(loginame) AS DataVal FROM master.dbo.sysprocesses WHERE (spid > $spid)"
+userlist_sql="SELECT 'UserName: ' AS DataDesc, CONVERT(varchar(32), loginame) AS loginame FROM master.dbo.sysprocesses WHERE (spid > $spid) GROUP BY loginame ORDER BY loginame"
+
+# Build Temp File
+echo "$usercount_sql" > $tmpfile
+echo -e "\\go\n" >> $tmpfile
+
+echo "$userlist_sql" >> $tmpfile
+echo -e "\\go\n" >> $tmpfile
+
+# Running SQL to get the results back.
+resultfile=`$mktempcmd /tmp/$hostname.XXXXXX`
+errorfile=`$mktempcmd /tmp/$hostname.XXXXXX`
+
+if [ "$sqshcmd" != "" ]; then
+	$sqshcmd -S $hostname -U $usr -P $pswd -i $tmpfile 2>$errorfile > $resultfile
+else
+	$tsqlcmd -S $hostname -U $usr -P $pswd < $tmpfile 2>$errorfile > $resultfile
+fi
+
+# echo "Temp File: $tmpfile"
+# echo "Result File: $resultfile"
+# echo "Error File: $errorfile"
+
+# Check for Failed Login
+$grepcmd -q "Login failed for user" $errorfile
+if [ "$?" == "0" ]; then
+	$rmcmd -f $tmpfile $resultfile $errorfile;
+        echo "MSSQL CRITICAL - Could not make connection to SQL server. Login failed.";
+        exit 2;
+fi
+
+# Check for connection problems
+$grepcmd -q "There was a problem connecting to the server" $errorfile
+if [ "$?" == "0" ]; then
+        $rmcmd -f $tmpfile $resultfile $errorfile;
+        echo "MSSQL CRITICAL - Could not make connection to SQL server. Incorrect server name or SQL service not running.";
+        exit 2;
+fi
+
+resultfileln=`$catcmd $resultfile | $wccmd -l | $sedcmd 's/  //g'`
+
+if [ "$resultfileln" == "2" ]; then
+	$rmcmd -f $tmpfile $resultfile $errorfile;
+        echo "MSSQL CRITICAL - Could not make connection to SQL server. No data received from host.";
+        exit 2;
+else
+	user_count=`$grepcmd UserCount $resultfile | awk '{print $2}'`
+	user_list=`$grepcmd UserName $resultfile |grep -v $usr | sed "s/CCCS.//g" | awk '{printf("%s, ", $2)}'`
+    $rmcmd -f $tmpfile $resultfile;
+
+	if (( $user_count > $critusers )); then
+	    echo "MSSQL CRITICAL - MS SQL Server $srv has $user_count user(s) connected: $user_list" | sed 's/[:,] $/./g';
+        exit 2;
+	elif (( $user_count > $warnusers )); then
+	    echo "MSSQL WARNING - MS SQL Server $srv has $user_count user(s) connected: $user_list" | sed 's/[:,] $/./g';
+        exit 1;
+	else
+	    echo "MSSQL OK - MS SQL Server $srv has $user_count user(s) connected: $user_list" | sed 's/[:,] $/./g';
+        exit 0;
+	fi
+fi
+
+# Cleaning up.
+
+$rmcmd -f $tmpfile
+$rmcmd -f $resultfile
+$rmcmd -f $errorfile
+ls -l /tmp/$1*
+echo $stdio
+exit $exit

@@ -1,0 +1,8 @@
+ logfile start '/tmp/afacli.log'
+ open afa0
+ controller details
+ container list /all /full
+ enclosure show slot
+ close
+ logfile end
+ exit

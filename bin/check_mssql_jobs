@@ -1,0 +1,192 @@
+#!/bin/bash
+
+#!/bin/bash
+# This script is designed to be used by Nagios. It checks for the availability of both Microsoft SQL Server 7 and 2000.
+#
+# Requirements:
+#
+# FreeTDS 6.0+ (http://www.freetds.org/)
+#
+# It was written by Tom De Blende (tom.deblende@village.uunet.be) in 2003. 
+#
+# Version 1.0.
+# Version 1.1: Rewritten the initial script so that it not only works from the CLI but also from within Nagios. Always helpful...
+# Version 1.2: Grouped output so things look a bit better.
+# Version 2.0: Rewritten the plugin to support version 6.0+ of FreeTDS. 
+#              Removed sqsh requirement as version 6.0+ of FreeTDS now offers its own CLI client: tsql.
+#              Older versions of FreeTDS are no longer supported.
+#
+#
+# You might want to change these values:
+
+sqshcmd=`which sqsh`
+tsqlcmd=`which tsql`
+catcmd=`which cat`
+grepcmd=`which grep`
+rmcmd=`which rm`
+mktempcmd=`which mktemp`
+wccmd=`which wc`
+sedcmd=`which sed`
+trcmd=`which tr`
+uniqcmd=`which uniq`
+
+###################################################################################################################
+
+hostname=$1
+usr=$2
+pswd=$3
+srv=$4
+
+warnusers=100
+critusers=150
+
+if [ ! "$#" == "4" ]; then
+        echo -e "\nYou did not supply enough arguments. \nUsage: $0 <host> <username> <password> <version> \n \n$0 checks Microsoft SQL Server connectivity. It works with versions 7 and 2000.\n\nYou need a working version of FreeTDS (http://www.freetds.org/) and tsql (included in FreeTDS 6.0+) to connect to the SQL server. \nIt was written by Tom De Blende (tom.deblende@village.uunet.be) in 2003. \n\nExample:\n $0 dbserver sa f00bar 2000\n" && exit "3"
+
+elif [ "$tsqlcmd" == "" ] && [ "$sqshcmd" == "" ]; then
+	echo -e "tsql not found! Please verify you have a working version of tsql (included in the FreeTDS version 6.0+) and enter the full path in the script." && exit "3"
+
+fi
+
+exit="3"
+
+
+# Creating the command file that contains the sql statement that has to be run on the SQL server.
+tmpjobs=`$mktempcmd /tmp/$hostname.XXXXXX`
+tmpfailed=`$mktempcmd /tmp/$hostname.XXXXXX`
+tmpdetail=`$mktempcmd /tmp/$hostname.XXXXXX`
+
+if [ "$srv" == "7" ]; then
+        spid=7
+elif [ "$srv" == "2000" ]; then
+        spid=50
+else
+	echo -e "$srv is not a supported MS SQL Server version!" && exit "3"
+fi
+
+jobcount_sql="SELECT 'FailedJobs	' + CONVERT(varchar(8), COUNT(*)) AS Counts
+FROM msdb.dbo.sysjobhistory sjh INNER JOIN
+	msdb.dbo.sysjobsteps sjs ON sjh.job_id = sjs.job_id AND sjh.step_id = sjs.step_id AND sjh.run_date = sjs.last_run_date AND 
+	sjh.run_time = sjs.last_run_time INNER JOIN
+	msdb.dbo.sysjobs sj ON sjs.job_id = sj.job_id
+WHERE (sjh.run_status <> 1) 
+	AND (sj.enabled = 1)
+UNION
+SELECT 'StepsRun	' + CONVERT(varchar(8), COUNT(*)) AS Counts
+FROM msdb.dbo.sysjobsteps sjs INNER JOIN
+	msdb.dbo.sysjobs sj ON sjs.job_id = sj.job_id INNER JOIN
+	msdb.dbo.sysjobhistory sjh ON sjs.job_id = sjh.job_id AND sjs.step_id = sjh.step_id AND sjs.last_run_date = sjh.run_date AND 
+	sjs.last_run_time = sjh.run_time
+WHERE (sj.enabled = 1)
+UNION
+SELECT 'JobsRun	' + CONVERT(varchar(8), COUNT(DISTINCT sj.name)) Counts
+FROM msdb.dbo.sysjobsteps sjs INNER JOIN
+	msdb.dbo.sysjobs sj ON sjs.job_id = sj.job_id INNER JOIN
+	msdb.dbo.sysjobhistory sjh ON sjs.job_id = sjh.job_id AND sjs.step_id = sjh.step_id AND sjs.last_run_date = sjh.run_date AND 
+	sjs.last_run_time = sjh.run_time
+WHERE (sj.enabled = 1)
+UNION
+SELECT 'JobName	' + MIN(sj.name) AS Counts
+FROM msdb.dbo.sysjobhistory sjh INNER JOIN
+	msdb.dbo.sysjobsteps sjs ON sjh.job_id = sjs.job_id AND sjh.step_id = sjs.step_id AND sjh.run_date = sjs.last_run_date AND 
+	sjh.run_time = sjs.last_run_time INNER JOIN
+	msdb.dbo.sysjobs sj ON sjs.job_id = sj.job_id
+WHERE (sjh.run_status <> 1) AND (sj.enabled = 1)
+UNION
+SELECT 'StepName	' + MIN(sjs.step_name) AS Counts
+FROM msdb.dbo.sysjobhistory sjh INNER JOIN
+	msdb.dbo.sysjobsteps sjs ON sjh.job_id = sjs.job_id AND sjh.step_id = sjs.step_id AND sjh.run_date = sjs.last_run_date AND 
+	sjh.run_time = sjs.last_run_time INNER JOIN
+	msdb.dbo.sysjobs sj ON sjs.job_id = sj.job_id
+WHERE (sjh.run_status <> 1) AND (sj.enabled = 1)"
+perfdata_sql="SELECT 'In Job \"' + sj.name + '\", step \"' + sjs.step_name + '\" failed.
+' + sjh.message
+FROM msdb.dbo.sysjobhistory sjh INNER JOIN
+	msdb.dbo.sysjobsteps sjs ON sjh.job_id = sjs.job_id AND sjh.step_id = sjs.step_id AND sjh.run_date = sjs.last_run_date AND 
+	sjh.run_time = sjs.last_run_time INNER JOIN
+	msdb.dbo.sysjobs sj ON sjs.job_id = sj.job_id
+WHERE     (sjh.run_status <> 1) AND (sj.enabled = 1)
+ORDER BY sjh.run_date DESC, sjh.run_time DESC"
+
+# Build Temp File
+echo "$jobcount_sql" > $tmpjobs
+echo -e "\\go\n" >> $tmpjobs
+
+echo "$perfdata_sql" >> $tmpdetail
+echo -e "\\go\n" >> $tmpdetail
+
+# Running SQL to get the results back.
+perfdatafile=`$mktempcmd /tmp/$hostname.XXXXXX`
+resultfile=`$mktempcmd /tmp/$hostname.XXXXXX`
+errorfile=`$mktempcmd /tmp/$hostname.XXXXXX`
+
+if [ "$sqshcmd" != "" ]; then
+	$sqshcmd -S $hostname -U $usr -P $pswd -i $tmpjobs 2>$errorfile > $resultfile
+	$sqshcmd -S $hostname -U $usr -P $pswd -i $tmpdetail -h -m bcp 2>$errorfile > $perfdatafile
+	#$sqshcmd -S $hostname -U $usr -P $pswd -i $tmpdetail -h -m html 2>$errorfile > $perfdatafile
+	#$sqshcmd -S $hostname -U $usr -P $pswd -i $tmpdetail -h -m horiz 2>$errorfile > $perfdatafile
+	#$sqshcmd -S $hostname -U $usr -P $pswd -i $tmpdetail -h -m pretty 2>$errorfile > $perfdatafile
+else
+	$tsqlcmd -S $hostname -U $usr -P $pswd < $tmpjobs 2>$errorfile > $resultfile
+	$tsqlcmd -S $hostname -U $usr -P $pswd < $tmpdetail 2>$errorfile > $perfdatafile
+fi
+
+# echo "Temp File: $tmpjobs"
+# echo "Perfdata File: $tmpdetail"
+# echo "Result File: $resultfile"
+# echo "Error File: $errorfile"
+# cat $tmpjobs $resultfile | less
+#cat $errorfile
+
+# Check for Failed Login
+$grepcmd -q "Login failed for user" $errorfile
+if [ "$?" == "0" ]; then
+	$rmcmd -f $tmpfile $resultfile $errorfile;
+
+fi
+
+# Check for connection problems
+$grepcmd -q "There was a problem connecting to the server" $errorfile
+if [ "$?" == "0" ]; then
+        $rmcmd -f $tmpfile $resultfile $errorfile;
+        echo "MSSQL CRITICAL - Could not make connection to SQL server. Incorrect server name or SQL service not running.";
+        exit 2;
+fi
+
+resultfileln=`$catcmd $resultfile | $wccmd -l | $sedcmd 's/  //g'`
+
+if [ "$resultfileln" == "2" ]; then
+	$rmcmd -f $tmpfile $resultfile $errorfile;
+        echo "MSSQL CRITICAL - Could not make connection to SQL server. No data received from host.";
+        exit 2;
+else
+	job_count=`$grepcmd JobsRun $resultfile | awk '{print $2}'`
+	step_count=`$grepcmd StepsRun $resultfile | awk '{print $2}'`
+	fail_count=`$grepcmd FailedJobs $resultfile | awk '{print $2}'`
+	job_name=`$grepcmd JobName $resultfile | awk '{print $2}'`
+	step_name=`$grepcmd StepName $resultfile | awk '{print $2}'`
+
+	if (( $fail_count > 1 )); then
+	    echo "MSSQL CRITICAL - MS SQL Server $srv had $fail_count job(s) fail" | sed 's/[:,] $/./g';
+	    echo "|"
+	    cat "$perfdatafile"
+        exit 2;
+	elif (( $fail_count == 1 )); then
+	    echo "MSSQL WARNING - MS SQL Server $srv job $job_name failed on step $step_name" | sed 's/[:,] $/./g';
+	    echo "|"
+	    cat "$perfdatafile"
+        exit 1;
+	else
+	    echo "MSSQL OK - MS SQL Server $srv completed $step_count step(s) in $job_count jobs(s)" | sed 's/[:,] $/./g';
+        exit 0;
+	fi
+fi
+
+# Cleaning up.
+
+$rmcmd -f $tmpfile
+$rmcmd -f $resultfile
+$rmcmd -f $errorfile
+ls -l /tmp/$1*
+echo $stdio
+exit $exit

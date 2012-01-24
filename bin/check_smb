@@ -1,0 +1,40 @@
+#!/bin/bash
+
+hostname="$1"
+sharename="$2"
+domainname="$3"
+username="$4"
+password="$5"
+
+exitcode=0
+
+if (( ${#username} == 0 )); then
+	echo "usage:"
+	echo "$0 [HOSTNAME] [SHARENAME] [DOMAINNAME] [USERNAME] (PASSWORD)"
+else
+	output=`mktemp`
+	errors=`mktemp`
+
+	smbclient -W ${domainname} \
+		-U ${username} \
+		-c "ls" \
+		//${hostname}/${sharename} ${password} 2> ${errors} > ${output}
+	result="$?"
+
+	if (( $result != 0 )); then
+		output_str=`cat $output`
+		echo "SMB CRITICAL: ${output_str}"
+		exitcode=2
+	else
+		output_str=`grep "blocks available" $output`
+		block_size=`echo "${output_str}" |sed -e 's/^.*blocks of size //' |sed -e 's/\. .*//'`
+		block_count=`echo "${output_str}" |sed -e 's/^.*\. //' |sed -e 's/ blocks available.*//'`
+		free_space="$((( ${block_size} * ${block_count} )))"
+		echo "SMB OK: ${free_space} bytes free"
+	fi
+
+	rm -f $output
+	rm -f $errors
+fi
+
+exit $exitcode
