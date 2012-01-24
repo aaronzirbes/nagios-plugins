@@ -1,0 +1,36 @@
+#!/usr/bin/groovy
+
+def shibStatusUrl = 'https://localhost/Shibboleth.sso/Status'
+
+def main = {
+	// use Curl to get the XML from the status page
+	def result = "curl --silent --insecure ${shibStatusUrl}".execute().text
+
+	// Check for valid result content
+	if (result && result.startsWith('<StatusHandler ') ) {
+
+		// Parse the XML
+		def xmlDom = new XmlParser().parseText(result)
+
+		// Default to fail
+		def status = '[Parse Failure]'
+
+		// Rather than a bunch of 
+		status = xmlDom?.Status?.getAt(0)?.children()?.collect{ it.name() }?.toString()
+		if ( ! status ) {
+			println "SHIBD CRITICAL - Failed to parse result from ${shibStatusUrl}"
+			return 2
+		} else if (status == '[OK]') {
+			println "SHIBD OK - ${shibStatusUrl} returns: ${status}"
+			return 0
+		} else {
+			println "SHIBD WARNING - ${shibStatusUrl} returns: ${status}"
+			return 1
+		}
+	} else {
+		println "SHIBD CRITICAL - Failed to get status from ${shibStatusUrl}"
+		return 2
+	}
+}
+
+System.exit( main() )
